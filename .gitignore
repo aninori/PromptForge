@@ -1,0 +1,40 @@
+# ── Node / frontend ──────────────────────────────────────────────
+node_modules/
+build/
+dist/
+coverage/
+out/
+
+# ── Archived React portal (superseded by vscode-extension/) ──────
+_archive/
+
+# ── Python / backend ─────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── Generated data (vector store, indexes, caches) ───────────────
+.chroma/
+backend/.chroma/
+*.pkl
+graph.json
+file_hashes.json
+agents.json
+backend/.github_repos/
+
+# ── Secrets & local config ───────────────────────────────────────
+.env*
+!.env.example
+
+# ── OS / editor noise ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/*
+!.vscode/launch.json
+
+# ── Claude Code local-machine settings ────────────────────────────
+.claude/settings.local.json

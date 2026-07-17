@@ -1,0 +1,14 @@
+Assessment complete — I read the architecture doc and verified it against the actual code (main.py, semantic_router.py, retrieval.py, agent_runner.py). The doc is accurate; the code matches it.
+
+Three-sentence explanation for a new developer
+PromptForge is a local-first RAG system: a React frontend talks to a FastAPI backend that indexes a codebase into Chroma (embedding chunks via Ollama, plus a BM25 sparse index and an import-graph), then answers questions about that code. Every query flows through one linear pipeline — semantic-cache check → intent/complexity classification (small model) → LLM query rewrite + expansion → hybrid retrieval (dense + BM25 fused with RRF, graph-neighbor expansion, cross-encoder rerank) → token-budgeted prompt assembly → generation (Ollama or Groq), streamed to the UI over SSE. "Agents" and "forge mode" are not separate systems — they're the same pipeline with a different system prompt, retrieval bias keywords, and extra stages (plan/patch) bolted on top.
+
+Biggest structural weakness: the pipeline exists three times
+The core pipeline is not a single piece of code — it's re-implemented in three places that must be kept in sync by hand:
+
+main.py:516 /query — delegates to semantic_router.route(), then does assembly/generation/accounting inline.
+main.py:360 _stream_pipeline — re-implements the entire routing sequence inline (cache lookup, intent guard, complexity tier, optimize, retrieve, agent select) so it can emit SSE stage events, even reaching into the router's private semantic_router._classify at main.py:396.
+agent_runner.py:526 _run_agent_internal — a third optimize→retrieve→generate flow with its own prompt building and its own streaming mechanism (background thread + queue).
+The tell is already in the code: the ~40 lines of token accounting and cache-save logic at main.py:468-497 and main.py:579-607 are near-identical copies. Any pipeline change — a new stage, a changed cache contract, a fix to the mode-scoping bug class — has to be made two or three times, and the streaming path will silently drift from the blocking path the first time someone forgets. The fix is cheap: make the pipeline one generator that yields stage events, and have /query simply drain it while /query/stream forwards the events as SSE.
+
+Runner-up (the runtime bottleneck, same root cause): before generation even starts, every uncached query makes four sequential LLM round-trips — intent classify, complexity classify, rewrite, expand — plus an embed per sub-query. On local Ollama that's easily several seconds of pre-flight before the first retrieval happens. The two classifier calls are independent and could run concurrently, and simple-tier queries arguably don't need expansion at all — but because the sequence is inlined in three places, no one place owns that optimization.

@@ -1,0 +1,93 @@
+{
+  "name": "promptforge-chat",
+  "displayName": "PromptForge Chat",
+  "description": "Chat with your indexed codebase via the PromptForge RAG pipeline",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "promptforge.chat",
+        "name": "promptforge",
+        "fullName": "PromptForge",
+        "description": "Ask about your indexed codebase",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "query",
+            "description": "Ask a question and get an answer (default mode)"
+          },
+          {
+            "name": "forge",
+            "description": "Forge a paste-ready prompt instead of answering"
+          },
+          {
+            "name": "agent",
+            "description": "Run the agent pipeline (findings, plan, patch)"
+          },
+          {
+            "name": "index",
+            "description": "Index the open workspace folder"
+          },
+          {
+            "name": "history",
+            "description": "List past queries"
+          },
+          {
+            "name": "model",
+            "description": "Pick the Ollama generation model"
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "PromptForge",
+      "properties": {
+        "promptforge.backendUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "PromptForge backend URL"
+        },
+        "promptforge.backendDir": {
+          "type": "string",
+          "default": "",
+          "description": "Path to PromptForge/backend for auto-start. Empty = look for backend/app/main.py in the workspace."
+        },
+        "promptforge.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python executable for auto-start. Empty = <backendDir>/.venv/Scripts/python.exe (or bin/python)."
+        },
+        "promptforge.model": {
+          "type": "string",
+          "default": "",
+          "description": "Ollama generation model override. Empty = backend default. Set via /model in chat."
+        },
+        "promptforge.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama URL (used by /model to list installed models)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc",
+    "watch": "tsc -w"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.8.0"
+  }
+}

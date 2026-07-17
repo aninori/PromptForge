@@ -1,0 +1,65 @@
+version: "3.9"
+
+services:
+  # ── Ollama (local LLM + embeddings) ──────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    # GPU pass-through (remove the deploy block if you have no GPU)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Model pull (runs once, then exits) ───────────────────────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama-init
+    depends_on:
+      - ollama
+    entrypoint: >
+      sh -c "
+        sleep 5 &&
+        ollama pull nomic-embed-text &&
+        ollama pull deepseek-coder-v2:16b
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    restart: "no"
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: promptforge-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - promptforge_data:/data
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - CF_CHROMA_DIR=/data/.chroma
+      - CF_GRAPH_PATH=/data/.chroma/graph.json
+      - CF_BM25_PATH=/data/.chroma/bm25.pkl
+      - CF_GEN_MODEL=deepseek-coder-v2:16b
+      - CF_EMBED_MODEL=nomic-embed-text
+      - CF_PROVIDER=ollama
+      # Optional — set to use Groq instead:
+      # - CF_PROVIDER=groq
+      # - GROQ_API_KEY=your_key_here
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_models:
+  promptforge_data:
