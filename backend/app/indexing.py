@@ -13,14 +13,50 @@ from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 
+import logging
+
 from . import bm25_index, graph_memory, ollama_client
 from .ast_chunker import chunk_file
 from .config import settings
 from .schemas import IndexResponse
-from .store import collection
-from .graph_memory import extract_imports, save_graph
+from .store import collection, reset_collection
+from .graph_memory import extract_imports, reset_graph, save_graph
+
+logger = logging.getLogger(__name__)
 
 _HASH_STORE_NAME = ".chroma/file_hashes.json"
+
+# Which repo the shared Chroma collections currently hold. Lives next to the
+# vector store (not inside the repo) because the store is global while repos
+# come and go — this is what lets us detect "the workspace changed".
+_REPO_MARKER_NAME = "indexed_repo.json"
+
+
+def _repo_marker_path() -> Path:
+    return Path(settings.chroma_dir) / _REPO_MARKER_NAME
+
+
+def indexed_repo() -> str | None:
+    """Absolute path of the repo currently in the index, or None if empty/unknown."""
+    p = _repo_marker_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text()).get("path") or None
+        except Exception:
+            pass
+    return None
+
+
+def _save_repo_marker(root: str, name: str) -> None:
+    p = _repo_marker_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"path": root, "name": name}))
+
+
+def _same_repo(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def _hash_store_path(root: str) -> Path:
@@ -118,6 +154,21 @@ def _link_graph(
 
 def index_repo(path: str, name: str | None = None, incremental: bool = True) -> IndexResponse:
     name = name or os.path.basename(os.path.abspath(path.rstrip("/")))
+    abs_path = os.path.abspath(path)
+
+    # Repo switch: chunk ids are repo-relative, so the previous repo's vectors
+    # would otherwise sit alongside this one's and get retrieved as if they
+    # belonged. Wipe every index-derived store and start clean.
+    previous = indexed_repo()
+    switching = previous is not None and not _same_repo(previous, abs_path)
+    if switching:
+        logger.info("Indexed repo changed (%s -> %s); resetting index", previous, abs_path)
+        reset_collection(settings.code_collection)
+        reset_collection(settings.summary_collection)
+        bm25_index.build([], [])
+        reset_graph()
+        incremental = False  # stale per-file hashes would skip files we just dropped
+
     col = collection(settings.code_collection)
 
     known_hashes = _load_hashes(path) if incremental else {}
@@ -219,6 +270,7 @@ def index_repo(path: str, name: str | None = None, incremental: bool = True) -> 
 
     _link_graph(imports_by_file, chunk_ids_by_file)
     save_graph()
+    _save_repo_marker(abs_path, name)
 
     n_chunks = col.count()
     return IndexResponse(

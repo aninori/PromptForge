@@ -79,3 +79,17 @@ def collection(name: str):
     return client().get_or_create_collection(
         name=name, metadata={"hnsw:space": "cosine"}
     )
+
+
+def reset_collection(name: str):
+    """Drop a collection and return a fresh empty one.
+
+    Used when the indexed repo changes: chunk ids are repo-relative paths, so
+    leaving the old repo's vectors in place would silently blend two codebases
+    into one retrieval space.
+    """
+    try:
+        client().delete_collection(name=name)
+    except Exception:
+        pass  # didn't exist — get_or_create below still gives us a clean one
+    return collection(name)

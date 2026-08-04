@@ -11,18 +11,27 @@ Run:  uvicorn app.main:app --reload --port 8000
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
-from . import agent_runner, cache, github_integration, indexing, pipeline, watcher
-from .config import settings
+# uvicorn configures handlers only for its own loggers, so without this every
+# logger.info/error in this package (indexing progress, watcher failures) is
+# dropped on the floor. Attach a root handler unless the host already set one up.
+# Must run BEFORE the package imports below: they execute module-level code that
+# logs (turn_store restoring persisted turns), which would otherwise vanish.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:     %(name)s - %(message)s",
+    )
+
+from . import cache, dashboard, github_integration, indexing, pipeline, savings, watcher  # noqa: E402
+from .config import settings  # noqa: E402
 from .schemas import (
-    AgentCard,
-    AgentRunRequest,
-    AgentRunResult,
     FeedbackRequest,
     IndexRequest,
     IndexResponse,
@@ -30,8 +39,9 @@ from .schemas import (
     QueryRequest,
     RepoEntry,
     RepoTreeResponse,
+    ReviewActionRequest,
 )
-from .store import collection
+from .store import collection  # noqa: E402
 
 app = FastAPI(title="PromptForge RAG API", version="0.1.0")
 
@@ -47,7 +57,14 @@ app.add_middleware(
 @app.get("/health")
 def health():
     code = collection(settings.code_collection)
-    return {"ok": True, "indexedChunks": code.count(), "provider": settings.provider}
+    return {
+        "ok": True,
+        "indexedChunks": code.count(),
+        "provider": settings.provider,
+        # Absolute path of the repo in the index — lets a client notice the
+        # index belongs to a different workspace and re-index.
+        "indexedRepo": indexing.indexed_repo(),
+    }
 
 
 @app.get("/config")
@@ -140,6 +157,30 @@ def index(req: IndexRequest):
         return result
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    """Self-contained savings dashboard. Served from the backend so its numbers
+    are live — it fetches /savings same-origin."""
+    return HTMLResponse(dashboard.PAGE)
+
+
+@app.get("/savings")
+def savings_totals():
+    """Cumulative count of turns that never became a Copilot call.
+
+    Deliberately an under-estimate — input context only, no model replies and
+    no allowance for the extra files Copilot reads while hunting. See
+    savings.py for why avoided *pasting* is not counted at all.
+    """
+    return savings.totals()
+
+
+@app.post("/savings/reset")
+def savings_reset():
+    savings.reset()
+    return {"ok": True}
 
 
 @app.get("/watcher/status")
@@ -300,55 +341,6 @@ def clear_cache():
     return {"ok": True, "removed": removed}
 
 
-@app.get("/agents", response_model=list[AgentCard])
-def agents():
-    return agent_runner.list_agents()
-
-
-@app.post("/agents", response_model=AgentCard, status_code=201)
-def create_agent(body: dict):
-    from .agent_registry import create_agent as _create
-    try:
-        return _create(
-            id=body.get("id", ""),
-            name=body.get("name", ""),
-            role=body.get("role", "Custom"),
-            purpose=body.get("purpose", ""),
-            focus=body.get("focus", ""),
-            color=body.get("color", "slate"),
-            system_prompt=body.get("systemPrompt", ""),
-            output_format=body.get("outputFormat", "Return a clear summary of your findings."),
-            retrieval_bias=body.get("retrievalBias", []),
-            default_top_k=int(body.get("defaultTopK", 6)),
-            use_expansion=bool(body.get("useExpansion", True)),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-
-@app.post("/agents/run", response_model=AgentRunResult)
-def run_agent(req: AgentRunRequest):
-    try:
-        return agent_runner.run_agent(req)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@app.post("/agents/stream")
-def run_agent_stream(req: AgentRunRequest):
-    return StreamingResponse(
-        agent_runner.run_agent_stream(req),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 # ---------------------------------------------------------------------------
 # Query pipeline — /query and /query/stream are thin consumers of the single
 # generator in pipeline.py. /query/stream forwards its events as SSE lines;
@@ -369,7 +361,15 @@ def _to_sse(events):
 @app.post("/query/stream")
 def query_stream(req: QueryRequest):
     """Streaming variant — uses SSE to progressively push tokens to the UI."""
-    events = pipeline.run_pipeline(req.query, req.mode, req.model, req.top_k, req.use_expansion, req.session_id)
+    events = pipeline.run_pipeline(
+        req.query, req.mode, req.model,
+        # Omitted fields fall back to config, so /config is authoritative rather
+        # than decorative. `is None` (not `or`) — use_expansion=False is a real
+        # choice, and `or` would silently flip it back to the configured value.
+        settings.top_k if req.top_k is None else req.top_k,
+        settings.use_expansion if req.use_expansion is None else req.use_expansion,
+        req.session_id,
+    )
     return StreamingResponse(
         _to_sse(events),
         media_type="text/event-stream",
@@ -383,13 +383,38 @@ def query_stream(req: QueryRequest):
 
 @app.post("/query", response_model=PipelineResult)
 def query(req: QueryRequest):
-    events = pipeline.run_pipeline(req.query, req.mode, req.model, req.top_k, req.use_expansion, req.session_id)
+    events = pipeline.run_pipeline(
+        req.query, req.mode, req.model,
+        # Omitted fields fall back to config, so /config is authoritative rather
+        # than decorative. `is None` (not `or`) — use_expansion=False is a real
+        # choice, and `or` would silently flip it back to the configured value.
+        settings.top_k if req.top_k is None else req.top_k,
+        settings.use_expansion if req.use_expansion is None else req.use_expansion,
+        req.session_id,
+    )
     for event, data in events:
         if event == "done":
             return data
         if event == "error":
             raise HTTPException(status_code=502, detail=data)
     raise HTTPException(status_code=502, detail="Pipeline ended without a result.")
+
+
+@app.post("/query/review")
+def query_review(req: ReviewActionRequest):
+    """Review-gate regeneration — refine a brief, or convert answer<->brief —
+    from a stored turn's already-retrieved chunks. Never re-runs retrieval.
+    Streaming only: the extension always consumes this via SSE."""
+    events = pipeline.run_review_action(req.turn_id, req.action, req.note, req.model)
+    return StreamingResponse(
+        _to_sse(events),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/feedback")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Generator
 
 import httpx
@@ -17,7 +18,10 @@ import requests
 
 from .config import settings
 
-_EMBED_CONCURRENCY = 16  # max simultaneous embed requests to Ollama
+logger = logging.getLogger(__name__)
+
+_EMBED_ATTEMPTS = 3   # per-request retries before the whole batch fails
+_EMBED_SLICE = 256    # texts per progress-logged slice
 
 
 def embed(text: str) -> list[float]:
@@ -40,19 +44,47 @@ def embed(text: str) -> list[float]:
 async def _embed_batch_async(texts: list[str]) -> list[list[float]]:
     url = settings.ollama_url
     model = settings.embed_model
-    sem = asyncio.Semaphore(_EMBED_CONCURRENCY)
+    sem = asyncio.Semaphore(max(1, settings.embed_concurrency))
 
     async def _one(client: httpx.AsyncClient, text: str) -> list[float]:
         async with sem:
-            r = await client.post(
-                f"{url}/api/embeddings",
-                json={"model": model, "prompt": text},
-            )
-            r.raise_for_status()
-            return r.json()["embedding"]
+            for attempt in range(1, _EMBED_ATTEMPTS + 1):
+                try:
+                    r = await client.post(
+                        f"{url}/api/embeddings",
+                        json={"model": model, "prompt": text},
+                    )
+                    r.raise_for_status()
+                    return r.json()["embedding"]
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    # Transient: Ollama's queue is backed up or the connection
+                    # dropped mid-flight. Back off and retry the single request
+                    # rather than failing the whole batch.
+                    if attempt == _EMBED_ATTEMPTS:
+                        raise RuntimeError(
+                            f"Embedding timed out after {_EMBED_ATTEMPTS} attempts. "
+                            f"Ollama at {url} may be overloaded — lower "
+                            f"CF_EMBED_CONCURRENCY (now {settings.embed_concurrency}) "
+                            f"or raise CF_EMBED_TIMEOUT (now {settings.embed_timeout}s). ({e})"
+                        ) from e
+                    await asyncio.sleep(2 ** attempt)
+                except httpx.HTTPStatusError as e:
+                    raise RuntimeError(
+                        f"Embedding failed. Is Ollama running at {url} "
+                        f"with `{model}` pulled? ({e})"
+                    ) from e
+            raise AssertionError("unreachable")  # pragma: no cover
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        return list(await asyncio.gather(*[_one(client, t) for t in texts]))
+    timeout = httpx.Timeout(settings.embed_timeout, connect=10)
+    out: list[list[float]] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Slice the work so a long index reports progress instead of going silent
+        # for minutes. Concurrency is still capped by the semaphore either way.
+        for i in range(0, len(texts), _EMBED_SLICE):
+            batch = texts[i : i + _EMBED_SLICE]
+            out.extend(await asyncio.gather(*[_one(client, t) for t in batch]))
+            logger.info("Embedded %d/%d chunks", len(out), len(texts))
+    return out
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
@@ -90,7 +122,7 @@ def chat(
                 "model": model,
                 "messages": messages,
                 "stream": False,
-                "options": {"temperature": temperature},
+                "options": {"temperature": temperature, "num_ctx": settings.num_ctx},
             },
             timeout=180,
         )
@@ -127,7 +159,7 @@ def chat_stream(
                 "model": model,
                 "messages": messages,
                 "stream": True,
-                "options": {"temperature": temperature},
+                "options": {"temperature": temperature, "num_ctx": settings.num_ctx},
             },
             stream=True,
             timeout=300,

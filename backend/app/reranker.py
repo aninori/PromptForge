@@ -13,6 +13,7 @@ original RRF ordering if sentence-transformers is not installed.
 """
 from __future__ import annotations
 
+from .config import settings
 from .schemas import RetrievedChunk
 
 _RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -33,7 +34,14 @@ def _get_model():
 
 
 def rerank(query: str, chunks: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
-    """Return top_k chunks reordered by cross-encoder relevance score.
+    """Return top_k chunks ranked by a blend of cross-encoder relevance and the
+    incoming vector/RRF score.
+
+    Blended, not replaced. This model is trained on MS MARCO web-search
+    passages, so it scores fluent English above code: letting it decide alone
+    put a 2-line README (vector 0.569) ahead of Sidebar.tsx (0.575) on a query
+    about click behaviour. Giving the retrieval score an equal vote keeps the
+    cross-encoder's judgement without letting prose bias override it outright.
 
     Falls back to original order[:top_k] if the model is unavailable.
     """
@@ -44,7 +52,18 @@ def rerank(query: str, chunks: list[RetrievedChunk], top_k: int) -> list[Retriev
         return chunks[:top_k]
 
     pairs = [(query, c.snippet[:_MAX_SNIPPET_CHARS]) for c in chunks]
-    scores = model.predict(pairs)
+    raw = [float(s) for s in model.predict(pairs)]
 
-    ranked = sorted(zip(chunks, scores), key=lambda x: float(x[1]), reverse=True)
-    return [c for c, _ in ranked[:top_k]]
+    # Cross-encoder output is an unbounded logit (often negative) — not on the
+    # same 0-1 scale as chunk.score, so min-max it across this candidate set
+    # before the two can be averaged meaningfully.
+    lo, hi = min(raw), max(raw)
+    span = (hi - lo) or 1.0
+    w = settings.rerank_weight
+
+    for c, s in zip(chunks, raw):
+        # Write the blended value back so the score shown in the brief matches
+        # the ordering that actually produced it.
+        c.score = round(w * ((s - lo) / span) + (1.0 - w) * c.score, 3)
+
+    return sorted(chunks, key=lambda c: c.score, reverse=True)[:top_k]

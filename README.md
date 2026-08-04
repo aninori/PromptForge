@@ -136,7 +136,7 @@ Chroma upsert (batches of 128)
 
 ```
 backend/app/
-├── main.py           POST /index /query /query/stream /agents /agents/stream
+├── main.py           POST /index /query /query/stream
 │                     GET  /health /config /history /repo/tree
 │                     POST /feedback /cache/clear
 │                     PATCH /config

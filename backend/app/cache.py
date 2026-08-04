@@ -10,27 +10,32 @@ Eviction: after every save, oldest entries are pruned when count > _MAX_CACHE_EN
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from datetime import datetime
 
 from . import ollama_client
 from .config import settings
-from .schemas import HistoryItem
+from .schemas import HistoryItem, RetrievedChunk
 from .store import collection
 
 _CACHE_TTL_DAYS = 30
 _MAX_CACHE_ENTRIES = 500
 
 
-def lookup(raw_query: str, mode: str = "answer") -> dict | None:
+def lookup(raw_query: str, mode: str | list[str] = "answer") -> dict | None:
     col = collection(settings.history_collection)
     if col.count() == 0:
         return None
     vec = ollama_client.embed(raw_query)
     # Scope the lookup to the same mode — an answer-mode essay must never be
-    # served for a forge-mode request (or vice versa).
-    res = col.query(query_embeddings=[vec], n_results=1, where={"mode": mode})
+    # served for a forge-mode request (or vice versa). An "auto" caller hasn't
+    # resolved a concrete mode yet (classification happens after this lookup,
+    # to keep a cache hit cheap), so it passes both scopes and either can match.
+    modes = [mode] if isinstance(mode, str) else mode
+    where = {"mode": modes[0]} if len(modes) == 1 else {"mode": {"$in": modes}}
+    res = col.query(query_embeddings=[vec], n_results=1, where=where)
     dists = res.get("distances", [[]])[0]
     if not dists:
         return None
@@ -61,7 +66,22 @@ def _evict_oldest(col) -> None:
         col.delete(ids=to_delete)
 
 
-def save(raw_query: str, optimized: str, answer: str, model: str, tokens_saved: int, mode: str = "answer") -> None:
+def save(
+    raw_query: str,
+    optimized: str,
+    answer: str,
+    model: str,
+    tokens_saved: int,
+    mode: str = "answer",
+    chunks: list[RetrievedChunk] | None = None,
+    task_text: str = "",
+    total_chunks: int = 0,
+    context_tokens: int = 0,
+) -> None:
+    """Store a completed run. `chunks`/`task_text`/`total_chunks` are what the
+    review gate needs to rebuild a refinable turn from a cache hit — without
+    them a cached brief could only ever be approved, never refined, since
+    re-retrieving to recover the context is forbidden."""
     col = collection(settings.history_collection)
     col.add(
         ids=[str(uuid.uuid4())],
@@ -74,6 +94,14 @@ def save(raw_query: str, optimized: str, answer: str, model: str, tokens_saved: 
             "model": model,
             "tokens_saved": tokens_saved,
             "mode": mode,
+            # Chroma metadata values must be scalars, so the chunk list rides
+            # along as a JSON string.
+            "chunks_json": json.dumps([c.model_dump() for c in (chunks or [])]),
+            "task_text": task_text,
+            "total_chunks": total_chunks,
+            # Context this run had to read. A later cache hit credits it as
+            # avoided work, since answering afresh would re-read the same code.
+            "context_tokens": context_tokens,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "ts": time.time(),
         }],

@@ -78,7 +78,7 @@ Three modes reuse this pipeline; they are **not** separate systems:
 3. **The semantic cache is mode-scoped.** Lookups filter `where={"mode": mode}` so a forge-mode prompt is never served for an answer-mode query. Preserve this in any cache change.
 4. **Forge mode seeds its Task section from the user's raw query**, not the optimized one (the optimized blob reads vague to humans); the optimized/expanded queries are still used for retrieval. Answer mode uses the optimized query as the task.
 5. **Token counting is a calibrated chars-per-token heuristic** (`store.py`), not a real tokenizer — deliberate, to avoid loading vocabs per Ollama model. It over-counts slightly on the fallback, which is the safe direction for budget enforcement.
-6. **The "naive baseline" token stat** (`chunk_count × avg_tokens_per_chunk`) is a marketing-style comparison metric, not a measurement. Don't try to make it precise.
+6. **The "naive baseline" token stat** is now a real measurement, not a marketing figure: `pipeline._naive_baseline()` sums the actual token count of every indexed chunk belonging to the files retrieval selected — i.e. what a developer would have pasted by hand. It replaced `chunk_count × avg_tokens_per_chunk` (every chunk in the repo), which inflated the claimed saving roughly 15x by comparing against something nobody would ever do.
 7. **The webhook HMAC check fails closed** (unconfigured secret ⇒ reject). Keep it that way.
 
 ## 6. Known debt — real problems, acknowledged, unfixed

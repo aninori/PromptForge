@@ -24,7 +24,8 @@ FORGE_SYSTEM_PROMPT = (
     "given in the user message (=== Task === … === Expected Output ===) and write "
     "nothing outside them. Never answer, solve, or explain the task; never write "
     "prose, advice, or numbered tips. Ground every detail in the supplied codebase "
-    "context — do not invent files."
+    "context — do not invent files, and do not invent constraints, requirements, "
+    'or causes. If the context does not support a section, write "None specified."'
 )
 
 _FORGE_HEADER = (
@@ -42,18 +43,34 @@ _FORGE_HEADER = (
     "Rules:\n"
     "- Derive ALL content from the codebase context below — do not invent files or code.\n"
     "- Quote actual file paths and code verbatim from the context.\n"
-    "- Task section: rewrite the user request as a precise engineering instruction.\n"
-    "- Relevant Files: list each path, one-line role annotation, then the key snippet.\n"
+    "- Task section: rewrite the user request as a precise engineering instruction. "
+    "If the user reported a problem without naming its cause, state the symptom "
+    "and ask for investigation — never assert a cause the user did not give.\n"
+    "- Relevant Files: list each path with its line range, then a terse note on what "
+    "it does. Do NOT paste the code itself — the developer's agent already has these "
+    "files open, so a copied snippet only adds tokens and risks contradicting the "
+    "real file. Point at the code; don't reproduce it.\n"
+    "  Keep each note under 10 words and start it with a verb. Never pad with "
+    '"This file matters because it contains the code that…" — write '
+    '"uploads videos and refreshes the list", not a sentence about the file.\n'
     "- Do NOT section: guardrails specific to this codebase (not generic advice).\n"
+    "- Tech Stack, Constraints and Do NOT: only state something you can point to in "
+    'the user\'s message or the context below. If you cannot, write "None specified." '
+    "Never invent a technical requirement — an empty section is safe, a fabricated "
+    "one makes the agent break working code.\n"
+    "- Never name a language, framework, library, tool, or pattern unless that name "
+    "literally appears in the context above. Do not infer it from what projects "
+    "like this usually use: if the context shows React but never mentions Redux, "
+    "Redux does not exist here. Listing a library the project does not use makes "
+    "the agent write code against an API that isn't installed.\n"
     "- Expected Output: describe which files to edit and what done looks like.\n\n"
     "# Codebase context\n"
 )
 
 
-def build(task: str, chunks: list[RetrievedChunk], total_chunks: int) -> tuple[str, list[RetrievedChunk]]:
-    header = _HEADER.format(task=task, n=len(chunks), total=total_chunks)
-    budget = settings.token_budget - count_tokens(header) - count_tokens(_FOOTER)
-
+def _fit_chunks(chunks: list[RetrievedChunk], budget: int) -> tuple[str, list[RetrievedChunk]]:
+    """Greedily keep highest-relevancy-first chunks until the token budget is hit.
+    Shared by build(), build_forge(), and refine_forge()."""
     kept: list[RetrievedChunk] = []
     body_parts: list[str] = []
     used = 0
@@ -65,8 +82,15 @@ def build(task: str, chunks: list[RetrievedChunk], total_chunks: int) -> tuple[s
         body_parts.append(block)
         used += t
         kept.append(c)
+    return "\n\n".join(body_parts), kept
 
-    prompt = header + "\n\n".join(body_parts) + _FOOTER
+
+def build(task: str, chunks: list[RetrievedChunk], total_chunks: int) -> tuple[str, list[RetrievedChunk]]:
+    header = _HEADER.format(task=task, n=len(chunks), total=total_chunks)
+    budget = settings.token_budget - count_tokens(header) - count_tokens(_FOOTER)
+
+    body, kept = _fit_chunks(chunks, budget)
+    prompt = header + body + _FOOTER
     return prompt, kept
 
 
@@ -82,15 +106,20 @@ _FORGE_TEMPLATE = (
     "codebase context above. No preamble, no prose, no code fences around the "
     "whole reply.\n\n"
     "=== Task ===\n"
-    "<rewrite the user's task as one precise engineering instruction>\n\n"
+    "<rewrite the user's task as one precise engineering instruction; if they "
+    "reported a problem without naming its cause, state the symptom and ask for "
+    "investigation instead of asserting a cause>\n\n"
     "=== Tech Stack ===\n"
-    "<languages, frameworks, and tools evident in the context>\n\n"
+    '<languages, frameworks, and tools visible in the context above, or "None specified">\n\n'
     "=== Relevant Files ===\n"
-    "<for each file: path — one-line role, then the key snippet>\n\n"
+    "<for each file, exactly two lines and no code, e.g.:\n"
+    "app/components/VideoPlayer.tsx (L91-190)\n"
+    "  - renders the video element and playback controls\n"
+    "Keep the note under 10 words, verb-first, no preamble.>\n\n"
     "=== Constraints ===\n"
-    "<guardrails specific to THIS codebase>\n\n"
+    '<guardrails you can point to in the user\'s message or the context, or "None specified">\n\n'
     "=== Do NOT ===\n"
-    "<things the agent must avoid here>\n\n"
+    '<things the agent must avoid here, evidenced by the context, or "None specified">\n\n'
     "=== Expected Output ===\n"
     "<which files to edit and what 'done' looks like>\n"
 )
@@ -107,18 +136,43 @@ def build_forge(task: str, chunks: list[RetrievedChunk], total_chunks: int) -> t
         - count_tokens(_FORGE_TEMPLATE)
     )
 
-    kept: list[RetrievedChunk] = []
-    body_parts: list[str] = []
-    used = 0
-    for c in chunks:
-        block = f"// {c.path} ({c.lines}) — relevancy {int(c.score * 100)}%\n{c.snippet}"
-        t = count_tokens(block)
-        if used + t > budget and kept:
-            break
-        body_parts.append(block)
-        used += t
-        kept.append(c)
-
-    context_body = "\n\n".join(body_parts)
+    context_body, kept = _fit_chunks(chunks, budget)
     prompt = _FORGE_HEADER + context_body + task_block + _FORGE_TEMPLATE
+    return prompt, kept
+
+
+_REFINE_HEADER = (
+    "# PROMPT FORGE — REFINE\n"
+    "You already produced a structured prompt for a developer (shown below as "
+    "the previous version). Revise it according to the user's refinement note. "
+    "Keep EXACTLY the six section headers (=== Task === … === Expected Output ===) "
+    "and write nothing outside them. Ground every detail in the supplied codebase "
+    "context — do not invent files, and do not invent constraints, requirements, "
+    'or causes. If the context does not support a section, write "None specified."\n\n'
+    "# Codebase context\n"
+)
+_REFINE_PREVIOUS_PREFIX = "\n\n# Previous forged prompt (revise this)\n"
+_REFINE_NOTE_PREFIX = "\n\n# User's refinement note\n"
+
+
+def refine_forge(
+    task_text: str,
+    previous_text: str,
+    note: str,
+    chunks: list[RetrievedChunk],
+    total_chunks: int,
+) -> tuple[str, list[RetrievedChunk]]:
+    """Rebuild a forge brief from the SAME retrieved chunks plus the previous
+    brief and a free-text note. Never re-retrieves — chunks/total_chunks come
+    from the stored TurnRecord, not from retrieval.retrieve()."""
+    task_block = _FORGE_TASK_PREFIX + task_text
+    previous_block = _REFINE_PREVIOUS_PREFIX + previous_text
+    note_block = _REFINE_NOTE_PREFIX + note
+    fixed_cost = count_tokens(
+        _REFINE_HEADER + task_block + previous_block + note_block + _FORGE_TEMPLATE
+    )
+    budget = settings.token_budget - fixed_cost
+
+    body, kept = _fit_chunks(chunks, budget)
+    prompt = _REFINE_HEADER + body + task_block + previous_block + note_block + _FORGE_TEMPLATE
     return prompt, kept

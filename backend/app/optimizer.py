@@ -17,9 +17,21 @@ from __future__ import annotations
 
 from . import ollama_client
 
+# "Be precise" alone makes this fabricate. Asked "why are the videos not
+# working?", a model with no way to say "cause unknown" invents a plausible cause
+# and the downstream template renders the guess as a requirement. Precision is
+# right for a known change ("add pagination"); for a diagnosis the honest
+# rewrite keeps the symptom and lets the downstream agent do the diagnosing.
 _REWRITE = (
     "You rewrite a developer's rough request into one precise, self-contained "
     "engineering instruction. Output only the rewritten instruction — no explanation.\n\n"
+    "If the user is reporting a problem and has not identified its cause, keep "
+    "the task as a symptom. Do not guess or assert a cause.\n"
+    'Bad:  "Fix the video source URL format"\n'
+    'Good: "Videos do not play in VideoPlayer. Investigate the cause and fix it."\n'
+    "Only name a cause if the user named it.\n"
+    "When the user HAS said what they want done, stay precise and specific — "
+    "this rule applies to unexplained problems, not to clear change requests.\n\n"
     "{q}"
 )
 

@@ -22,26 +22,16 @@ interface PipelineResult {
   model: string;
   latencyMs: number;
   cached: boolean;
-}
-
-interface AgentFinding {
-  severity: string;
-  title: string;
-  detail: string;
-  files: string[];
-}
-
-interface AgentRunResult {
-  agentId: string;
-  agentName: string;
-  model: string;
-  summary: string;
-  relevantFiles: RetrievedChunk[];
-  findings: AgentFinding[];
-  plan: string[];
-  answer: string;
-  patchDiff: string;
-  patchFiles: string[];
+  mode: 'answer' | 'forge';
+  turnId?: string;
+  tokens: {
+    /** Token cost of pasting the retrieved files in full — what this replaces. */
+    naiveBaseline: number;
+    /** Token cost of what was actually delivered. */
+    optimized: number;
+    saved: number;
+    savedPct: number;
+  };
 }
 
 interface HistoryItem {
@@ -63,6 +53,30 @@ let backendProc: ChildProcess | undefined;
 // ponytail: one live session id; per-session Map if concurrent chats matter
 let sessionId = randomUUID();
 
+// Refine needs free text, and a button click can't collect it (no stream, no
+// input box round-trip needed) — arm this flag instead, then treat the user's
+// very next message in the same session as the refinement note.
+let pendingRefine: { sessionId: string; turnId: string } | undefined;
+
+// Sentinel prompts for the two no-input review-gate escape hatches, driven by
+// followupProvider (clicking a followup resubmits its `.prompt` as a brand-new
+// request through this same handler with a fresh stream).
+const EXPLAIN_INSTEAD_PROMPT = 'Just explain it instead of a brief.';
+const MAKE_BRIEF_PROMPT = 'Turn this into a forged brief instead.';
+
+/** Recover the previous turn's PfChatResult.metadata from chat history — VS
+ * Code writes ChatResult onto each ChatResponseTurn but this codebase never
+ * read it back until now. Duck-typed (`'result' in h`) rather than an
+ * instanceof check on vscode.ChatResponseTurn, since history mixes request
+ * and response turn types. */
+function lastMetadata(chatContext: vscode.ChatContext): PfChatResult['metadata'] | undefined {
+  for (let i = chatContext.history.length - 1; i >= 0; i--) {
+    const h = chatContext.history[i] as any;
+    if ('result' in h) return (h.result as PfChatResult).metadata;
+  }
+  return undefined;
+}
+
 const workspaceRoot = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
 // ---------- HTTP helpers ----------
@@ -73,6 +87,19 @@ async function getJson<T>(urlPath: string, timeoutMs = 10_000): Promise<T> {
   });
   if (!res.ok) throw new Error(`Backend ${res.status} on ${urlPath}`);
   return (await res.json()) as T;
+}
+
+/**
+ * Node's `fetch` reports transport failures as a bare `TypeError: fetch failed`
+ * and hides the real reason (ECONNREFUSED, HeadersTimeoutError, …) on `.cause`.
+ * Always unwrap it — otherwise every network problem looks identical.
+ */
+function errMessage(err: any): string {
+  const msg = err?.message ?? String(err);
+  const cause = err?.cause;
+  if (!cause) return msg;
+  const detail = cause?.code ?? cause?.message ?? String(cause);
+  return detail && !msg.includes(detail) ? `${msg} (${detail})` : msg;
 }
 
 async function postJson<T>(urlPath: string, body: unknown): Promise<T> {
@@ -138,6 +165,18 @@ interface Health {
   ok: boolean;
   indexedChunks: number;
   provider: string;
+  /** Absolute path of the repo currently in the index (null if never indexed). */
+  indexedRepo?: string | null;
+}
+
+/** Path comparison for index identity: case-insensitive on Windows, slash-agnostic. */
+function samePath(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  const norm = (p: string) => {
+    const resolved = path.resolve(p).replace(/[\\/]+$/, '');
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return norm(a) === norm(b);
 }
 
 function resolveBackendDir(): string | undefined {
@@ -158,19 +197,26 @@ async function health(timeoutMs = 1500): Promise<Health | undefined> {
   }
 }
 
+// ---------- auto-index-on-activation state ----------
+// `ensureBackend`/`indexWorkspace` run once at activation with nobody watching
+// (kicked off before any chat turn exists), and the shared promise below lets a
+// request that arrives mid-index reuse that same in-flight work instead of
+// double-spawning uvicorn. Since neither function ever has a live stream to
+// write into, failures are recorded here instead and surfaced by the chat
+// handler once `kickOffBackend()`'s promise resolves.
+let backendError: string | undefined;
+
 /** Health-check, spawn uvicorn if down, auto-index the workspace if the index is empty. */
-async function ensureBackend(
-  stream: vscode.ChatResponseStream
-): Promise<Health | undefined> {
+async function ensureBackend(): Promise<Health | undefined> {
+  backendError = undefined;
   let h = await health();
   if (!h) {
     const dir = resolveBackendDir();
     if (!dir) {
-      stream.markdown(
+      backendError =
         `PromptForge backend is not running at \`${backendUrl()}\` and I can't find ` +
-          '`backend/app/main.py` in this workspace. Start it manually or set ' +
-          '`promptforge.backendDir` in settings.'
-      );
+        '`backend/app/main.py` in this workspace. Start it manually or set ' +
+        '`promptforge.backendDir` in settings.';
       return undefined;
     }
     const python =
@@ -181,13 +227,11 @@ async function ensureBackend(
         process.platform === 'win32' ? 'Scripts\\python.exe' : 'bin/python'
       );
     if (!fs.existsSync(python)) {
-      stream.markdown(
+      backendError =
         `Can't start the backend: Python not found at \`${python}\`. ` +
-          'Set `promptforge.pythonPath` in settings.'
-      );
+        'Set `promptforge.pythonPath` in settings.';
       return undefined;
     }
-    stream.progress('Starting PromptForge backend…');
     const port = new URL(backendUrl()).port || '8000';
     // no --reload: the reloader parent orphans its worker on Windows kill
     backendProc = spawn(python, ['-m', 'uvicorn', 'app.main:app', '--port', port], {
@@ -200,34 +244,56 @@ async function ensureBackend(
       h = await health();
     }
     if (!h) {
-      stream.markdown(
+      backendError =
         'Backend failed to start within 120s. Check that dependencies are installed ' +
-          `(\`${python} -m pip install -r requirements.txt\` in \`${dir}\`).`
-      );
+        `(\`${python} -m pip install -r requirements.txt\` in \`${dir}\`).`;
       return undefined;
     }
   }
-  // ponytail: no repo-identity check on the global index; /index to re-point it
-  if (h.indexedChunks === 0 && workspaceRoot()) {
-    await indexWorkspace(stream);
+  // The index is global (one repo at a time), so re-index whenever it's empty
+  // OR belongs to a different workspace than the one that's open — otherwise
+  // opening another project would silently answer from the previous repo's code.
+  const root = workspaceRoot();
+  if (root && (h.indexedChunks === 0 || !samePath(h.indexedRepo, root))) {
+    await indexWorkspace();
     h = (await health()) ?? h;
   }
   return h;
 }
 
-async function indexWorkspace(stream: vscode.ChatResponseStream): Promise<void> {
+async function indexWorkspace(): Promise<void> {
   const root = workspaceRoot();
-  if (!root) {
-    stream.markdown('No workspace folder open — nothing to index.');
-    return;
-  }
-  stream.progress(`Indexing ${path.basename(root)}…`);
-  const res = await postJson<{ name: string; files: number; chunks: number }>('/index', {
-    path: root,
-  });
-  stream.markdown(
-    `Indexed **${res.name}**: ${res.files} files → ${res.chunks} chunks.\n\n`
-  );
+  if (!root) return; // no workspace open — nothing to index, nothing to report
+  await postJson<{ name: string; files: number; chunks: number }>('/index', { path: root });
+}
+
+// Shared in-flight promise so activation-time indexing and a request that
+// arrives mid-index converge on the same work instead of double-spawning
+// uvicorn. `indexPhase` lets the chat handler show the right progress message
+// without needing a stream reference inside the activation-time call itself.
+type IndexPhase = 'not_started' | 'indexing' | 'ready' | 'failed';
+let indexPhase: IndexPhase = 'not_started';
+let backendReadyPromise: Promise<Health | undefined> | null = null;
+
+function kickOffBackend(): Promise<Health | undefined> {
+  if (backendReadyPromise) return backendReadyPromise;
+  indexPhase = 'indexing';
+  backendReadyPromise = ensureBackend()
+    // indexWorkspace()'s postJson call can throw (e.g. mid-index network error);
+    // fold that into the same "failed" bookkeeping instead of leaving the shared
+    // promise permanently rejected.
+    .catch((err) => {
+      backendError = errMessage(err);
+      return undefined;
+    })
+    .then((h) => {
+      indexPhase = h ? 'ready' : 'failed';
+      // Don't cache a failure forever — clear the shared promise so the next
+      // chat turn (or a retry) gets a fresh attempt instead of being stuck.
+      if (!h) backendReadyPromise = null;
+      return h;
+    });
+  return backendReadyPromise;
 }
 
 // ---------- rendering helpers ----------
@@ -239,6 +305,28 @@ const STAGE_LABELS: Record<string, string> = {
   assembling: 'Assembling prompt…',
   generating: 'Generating…',
 };
+
+/** One-line footer describing what actually happened on this turn.
+ *
+ * Deliberately NOT a savings claim. The previous version reported "~26,400
+ * saved vs. pasting these 4 files", but Copilot runs inside VS Code and reads
+ * files itself — nobody pastes them, so the avoided cost was imaginary. (Its
+ * predecessor was worse: it compared against pasting all 622 chunks of the
+ * repo.) Every number below is an event that occurred; real avoided-call
+ * totals live behind /savings and are surfaced by `/history`. */
+function renderStats(stream: vscode.ChatResponseStream, result: PipelineResult) {
+  if (result.cached) {
+    stream.markdown('\n\n_Served from cache — no retrieval or generation run._');
+    return;
+  }
+  const files = new Set(result.chunks.map((c) => c.path)).size;
+  if (!files) return; // off-topic guardrail — nothing was searched
+  const brief = result.tokens?.optimized;
+  stream.markdown(
+    `\n\n_Narrowed to ${files === 1 ? '1 file' : `${files} files`}` +
+      (brief ? ` · ${brief.toLocaleString()}-token ${result.mode === 'forge' ? 'brief' : 'answer'}_` : '_')
+  );
+}
 
 function addReferences(stream: vscode.ChatResponseStream, chunks: RetrievedChunk[]) {
   const root = workspaceRoot();
@@ -255,19 +343,46 @@ function addReferences(stream: vscode.ChatResponseStream, chunks: RetrievedChunk
 // ---------- mode handlers ----------
 
 interface PfChatResult extends vscode.ChatResult {
-  metadata?: { sessionId: string; chunkIds?: string[] };
+  metadata?: {
+    sessionId: string;
+    chunkIds?: string[];
+    turnId?: string;
+    mode?: 'answer' | 'forge';
+  };
+}
+
+/** Review-gate buttons — nothing reaches Copilot until Approve is clicked.
+ * Approve renders for any forge-mode result (even a cache hit — it needs no
+ * chunks, just the text). Refine needs the turn's stored chunks to regenerate
+ * without re-retrieving, which cache hits never have (chunks=[]), so it's
+ * omitted whenever there's no turnId. */
+function attachReviewGate(stream: vscode.ChatResponseStream, result: PipelineResult) {
+  if (result.mode !== 'forge') return;
+  stream.button({
+    command: 'promptforge.approve',
+    arguments: [result.answer],
+    title: 'Approve → send to Copilot',
+  });
+  if (result.turnId) {
+    stream.button({
+      command: 'promptforge.refine',
+      arguments: [sessionId, result.turnId],
+      title: 'Refine',
+    });
+  }
 }
 
 async function handleQuery(
   request: vscode.ChatRequest,
   stream: vscode.ChatResponseStream,
   signal: AbortSignal,
-  mode: 'answer' | 'forge'
+  mode: 'answer' | 'forge' | 'auto'
 ): Promise<PfChatResult> {
+  // topK/useExpansion are deliberately omitted so the backend's configured
+  // values win. Hardcoding them here silently pinned retrieval to 4 chunks and
+  // made CF_TOP_K a no-op — /config reported 8 while every query still used 4.
   const body = {
     query: request.prompt,
-    topK: 4,
-    useExpansion: true,
     sessionId,
     mode,
     model: cfg().get<string>('model', '') || undefined,
@@ -281,80 +396,93 @@ async function handleQuery(
   }
   if (result) {
     addReferences(stream, result.chunks);
-    if (mode === 'forge')
-      stream.button({
-        command: 'promptforge.copy',
-        arguments: [result.answer],
-        title: 'Copy forged prompt',
-      });
+    renderStats(stream, result);
+    attachReviewGate(stream, result);
   }
-  return { metadata: { sessionId, chunkIds: result?.chunks.map((c) => c.id) } };
+  return {
+    metadata: {
+      sessionId,
+      chunkIds: result?.chunks.map((c) => c.id),
+      turnId: result?.turnId,
+      mode: result?.mode,
+    },
+  };
 }
 
-async function handleAgent(
-  request: vscode.ChatRequest,
+/** Refine / "just explain it" / "make a brief" — regenerates a stored turn's
+ * content from its already-retrieved chunks via /query/review. Mirrors
+ * handleQuery's SSE consumption and button rendering. */
+async function handleReviewAction(
+  turnId: string,
+  action: 'refine' | 'to_answer' | 'to_brief',
+  note: string | undefined,
   stream: vscode.ChatResponseStream,
   signal: AbortSignal
 ): Promise<PfChatResult> {
-  const root = workspaceRoot() ?? '.';
   const body = {
-    agentId: 'auto',
-    repoPath: root,
-    targetPath: root,
-    userRequest: request.prompt,
-    logs: '',
-    attachments: [],
-    topK: 6,
-    useExpansion: false,
+    turnId,
+    action,
+    note,
     model: cfg().get<string>('model', '') || undefined,
   };
-  let result: AgentRunResult | undefined;
-  for await (const { event, data } of sse('/agents/stream', body, signal)) {
-    if (event === 'stage') stream.progress(String(data));
-    else if (event === 'log') stream.progress(`${data.stage}: ${data.message}`);
-    else if (event === 'done') result = data as AgentRunResult;
+  let result: PipelineResult | undefined;
+  for await (const { event, data } of sse('/query/review', body, signal)) {
+    if (event === 'stage') stream.progress(STAGE_LABELS[data] ?? String(data));
+    else if (event === 'token') stream.markdown(String(data));
+    else if (event === 'done') result = data as PipelineResult;
     else if (event === 'error') stream.markdown(`\n\n**Error:** ${data}`);
-    // artifact events skipped: the done payload is a superset
   }
   if (result) {
-    stream.markdown(`**${result.agentName}** (${result.model})\n\n${result.summary}\n\n`);
-    if (result.findings.length) {
-      stream.markdown('### Findings\n');
-      for (const f of result.findings)
-        stream.markdown(`- **[${f.severity}]** ${f.title} — ${f.detail}\n`);
-      stream.markdown('\n');
-    }
-    if (result.plan.length) {
-      stream.markdown('### Plan\n');
-      result.plan.forEach((step, i) => stream.markdown(`${i + 1}. ${step}\n`));
-      stream.markdown('\n');
-    }
-    if (result.answer) stream.markdown(`${result.answer}\n\n`);
-    if (result.patchDiff) {
-      stream.markdown('### Patch\n```diff\n' + result.patchDiff + '\n```\n');
-      stream.button({
-        command: 'promptforge.copy',
-        arguments: [result.patchDiff],
-        title: 'Copy patch',
-      });
-    }
-    addReferences(stream, result.relevantFiles);
+    addReferences(stream, result.chunks);
+    renderStats(stream, result);
+    attachReviewGate(stream, result);
   }
-  return { metadata: { sessionId, chunkIds: result?.relevantFiles.map((c) => c.id) } };
+  return {
+    metadata: {
+      sessionId,
+      chunkIds: result?.chunks.map((c) => c.id),
+      turnId: result?.turnId,
+      mode: result?.mode,
+    },
+  };
+}
+
+interface SavingsTotals {
+  answeredLocally: number;
+  refinedLocally: number;
+  cacheHits: number;
+  contextTokens: number;
+  copilotCallsAvoided: number;
+  since: string;
 }
 
 async function handleHistory(stream: vscode.ChatResponseStream): Promise<void> {
+  // Avoided-call totals first — this is the honest version of "tokens saved".
+  try {
+    const s = await getJson<SavingsTotals>('/savings', 5000);
+    if (s.copilotCallsAvoided > 0) {
+      stream.markdown(
+        `**${s.copilotCallsAvoided} Copilot call${s.copilotCallsAvoided === 1 ? '' : 's'} avoided**` +
+          `${s.since ? ` since ${s.since}` : ''} — ` +
+          `${s.answeredLocally} answered locally, ${s.refinedLocally} refined before sending, ` +
+          `${s.cacheHits} served from cache.\n\n` +
+          `Roughly **${s.contextTokens.toLocaleString()} tokens** of code PromptForge read ` +
+          `instead of Copilot. Rough estimate — the real saving is probably higher.\n\n`
+      );
+    }
+  } catch {
+    // older backend without /savings — the history table below still works
+  }
+
   const items = await getJson<HistoryItem[]>('/history');
   if (!items.length) {
     stream.markdown('No query history yet.');
     return;
   }
-  stream.markdown('| Query | Date | Model | Tokens saved |\n|---|---|---|---|\n');
+  stream.markdown('| Query | Date | Model |\n|---|---|---|\n');
   for (const it of items.slice(0, 20)) {
     const q = it.query.replace(/\|/g, '\\|').replace(/\n/g, ' ').slice(0, 80);
-    stream.markdown(
-      `| ${q} | ${it.date} | ${it.model} | ${it.tokensSaved}${it.cached ? ' (cached)' : ''} |\n`
-    );
+    stream.markdown(`| ${q} | ${it.date} | ${it.model}${it.cached ? ' (cached)' : ''} |\n`);
   }
 }
 
@@ -376,7 +504,7 @@ async function handleModelPick(
   }
   // ask the backend which model it actually generates with; fall back to the
   // documented small-tier default if the backend isn't up yet
-  let defaultModel = 'mistral:7b';
+  let defaultModel = 'deepseek-coder-v2:16b';
   try {
     const rc = await getJson<{ generationModel: string }>('/config', 2000);
     defaultModel = rc.generationModel;
@@ -420,6 +548,11 @@ async function handleModelPick(
 // ---------- activation ----------
 
 export function activate(context: vscode.ExtensionContext) {
+  // Kick off backend startup + indexing now, not on the user's first message —
+  // cold indexing can take minutes, so get ahead of it. Fire-and-forget: nobody's
+  // watching yet, and the chat handler awaits this same shared promise later.
+  void kickOffBackend().catch(() => {});
+
   const handler: vscode.ChatRequestHandler = async (request, chatContext, stream, token) => {
     if (chatContext.history.length === 0) sessionId = randomUUID(); // new chat session
     const controller = new AbortController();
@@ -430,26 +563,55 @@ export function activate(context: vscode.ExtensionContext) {
         await handleModelPick(request, stream);
         return {};
       }
-      const h = await ensureBackend(stream);
-      if (!h) return {};
+      const wasWaiting = indexPhase === 'not_started' || indexPhase === 'indexing';
+      if (indexPhase === 'not_started')
+        stream.progress('Starting PromptForge and indexing this workspace — first response may take a bit…');
+      else if (indexPhase === 'indexing')
+        stream.progress('Still indexing this workspace, hang tight…');
+      const h = await kickOffBackend();
+      if (!h) {
+        stream.markdown(backendError ?? 'PromptForge backend failed to start.');
+        return {};
+      }
+      if (wasWaiting) stream.markdown(`Ready — ${h.indexedChunks} chunks indexed.\n\n`);
+
+      // Refine armed by a button click: this message IS the note (collected in
+      // the dialog and prefilled here, or typed directly).
+      if (pendingRefine) {
+        const { sessionId: armedFor, turnId } = pendingRefine;
+        pendingRefine = undefined;
+        if (armedFor === sessionId)
+          return await handleReviewAction(turnId, 'refine', request.prompt, stream, controller.signal);
+        // `sessionId` is regenerated on an empty history, so starting a new chat
+        // between the click and the note orphans the armed turn. Say so rather
+        // than silently answering the note as a brand-new question.
+        stream.markdown(
+          "That Refine was for an earlier chat, so it's no longer attached — " +
+            'answering this as a new request instead.\n\n'
+        );
+      }
+      // "Just explain it instead" / "Turn this into a brief" followups.
+      const priorMeta = lastMetadata(chatContext);
+      if (priorMeta?.turnId && request.prompt === EXPLAIN_INSTEAD_PROMPT)
+        return await handleReviewAction(priorMeta.turnId, 'to_answer', undefined, stream, controller.signal);
+      if (priorMeta?.turnId && request.prompt === MAKE_BRIEF_PROMPT)
+        return await handleReviewAction(priorMeta.turnId, 'to_brief', undefined, stream, controller.signal);
+
       switch (request.command) {
-        case 'index':
-          await indexWorkspace(stream);
-          return {};
         case 'history':
           await handleHistory(stream);
           return {};
-        case 'agent':
-          return await handleAgent(request, stream, controller.signal);
         case 'forge':
           return await handleQuery(request, stream, controller.signal, 'forge');
         case 'query':
-        default:
           return await handleQuery(request, stream, controller.signal, 'answer');
+        default:
+          // No explicit command — let the backend router decide question vs. task.
+          return await handleQuery(request, stream, controller.signal, 'auto');
       }
     } catch (err: any) {
       if (!token.isCancellationRequested)
-        stream.markdown(`\n\n**Error:** ${err?.message ?? String(err)}`);
+        stream.markdown(`\n\n**Error:** ${errMessage(err)}`);
       return {};
     } finally {
       sub.dispose();
@@ -466,12 +628,65 @@ export function activate(context: vscode.ExtensionContext) {
       chunkIds: meta.chunkIds ?? [],
     }).catch(() => {});
   });
+  // Escape hatches for the review gate — mirrored on the forge/answer paths.
+  // Clicking a followup resubmits its prompt as a brand-new request through
+  // `handler` above, which matches it against the two sentinel strings.
+  participant.followupProvider = {
+    provideFollowups(result: vscode.ChatResult) {
+      const meta = (result as PfChatResult).metadata;
+      if (!meta?.turnId) return [];
+      if (meta.mode === 'forge')
+        return [{ prompt: EXPLAIN_INSTEAD_PROMPT, label: 'Just explain it instead' }];
+      if (meta.mode === 'answer')
+        return [{ prompt: MAKE_BRIEF_PROMPT, label: 'Turn this into a brief' }];
+      return [];
+    },
+  };
 
   context.subscriptions.push(
     participant,
-    vscode.commands.registerCommand('promptforge.copy', (text: string) => {
-      vscode.env.clipboard.writeText(text);
-      vscode.window.setStatusBarMessage('PromptForge: copied to clipboard', 2000);
+    vscode.commands.registerCommand('promptforge.approve', async (text: string) => {
+      // Clipboard is the guaranteed path — always do it first. `chat.open`'s
+      // `isPartialQuery: true` is the only DOCUMENTED usage (prefill without
+      // auto-submit; it's not part of the stable public API, and whether
+      // omitting isPartialQuery reliably auto-submits is unconfirmed and
+      // version-dependent — never rely on that). If chat.open isn't available
+      // in this VS Code version, the user still has the brief on their clipboard.
+      await vscode.env.clipboard.writeText(text);
+      try {
+        await vscode.commands.executeCommand('workbench.action.chat.open', {
+          query: text,
+          isPartialQuery: true,
+        });
+      } catch {
+        vscode.window.setStatusBarMessage('PromptForge: brief copied — paste into Copilot Chat.', 4000);
+      }
+    }),
+    // Collect the refinement note up front in a dialog. A command handler has no
+    // ChatResponseStream to render into, so the note is prefilled back into the
+    // chat box: submitting it re-enters `handler` as an ordinary turn, where the
+    // armed `pendingRefine` reroutes it to /query/review with a live stream.
+    vscode.commands.registerCommand('promptforge.refine', async (forSessionId: string, turnId: string) => {
+      const note = await vscode.window.showInputBox({
+        title: 'Refine this brief',
+        prompt: 'What is wrong with this brief? What should change?',
+        placeHolder: 'e.g. too vague about error handling; focus on the auth module',
+        ignoreFocusOut: true, // survives clicking away mid-typing
+        validateInput: (v) => (v.trim() ? undefined : 'Describe what should change'),
+      });
+      if (!note?.trim()) return; // cancelled — arm nothing, leave no stale state
+      pendingRefine = { sessionId: forSessionId, turnId };
+      try {
+        await vscode.commands.executeCommand('workbench.action.chat.open', {
+          query: `@promptforge ${note.trim()}`,
+          isPartialQuery: true,
+        });
+      } catch {
+        vscode.window.setStatusBarMessage(
+          'PromptForge: send your note as the next @promptforge message.',
+          5000
+        );
+      }
     }),
     vscode.commands.registerCommand('promptforge.setModel', async (name: string) => {
       await cfg().update('model', name, vscode.ConfigurationTarget.Global);

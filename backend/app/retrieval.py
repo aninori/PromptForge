@@ -12,6 +12,8 @@ closing the RLHF loop started by the /feedback endpoint.
 """
 from __future__ import annotations
 
+import os
+
 from . import bm25_index, ollama_client, reranker
 from .config import settings
 from .graph_memory import get_graph
@@ -19,6 +21,38 @@ from .schemas import RetrievedChunk
 from .store import collection
 
 _RRF_K = 60  # standard RRF constant — higher = gentler rank differences
+_DOC_EXTS = {".md", ".txt", ".rst"}
+
+
+def _cap_docs(chunks: list[RetrievedChunk], top_k: int, max_docs: int) -> list[RetrievedChunk]:
+    """Take the best `top_k`, allowing at most `max_docs` prose chunks.
+
+    Both scorers favour fluent English over code, so documentation crowds out the
+    files that actually implement the behaviour being asked about — docs took 4
+    of 8 slots on a "why does clicking X do Y" query, leaving zero components.
+
+    A cap rather than an exclusion: for "how do I set this project up" the README
+    genuinely is the answer, so docs stay eligible, just not dominant.
+
+    A per-file quota was tried alongside this and reverted — it cost the video
+    query 5 components -> 3 without recovering any on the query it targeted.
+    """
+    out: list[RetrievedChunk] = []
+    docs = 0
+    for c in chunks:
+        if os.path.splitext(c.path)[1].lower() in _DOC_EXTS:
+            if docs >= max_docs:
+                continue
+            docs += 1
+        out.append(c)
+        if len(out) >= top_k:
+            break
+    # Never return fewer than asked for just because a quota bit — backfill with
+    # whatever was skipped rather than handing back a short result.
+    if len(out) < top_k:
+        seen = {c.id for c in out}
+        out.extend(c for c in chunks if c.id not in seen)
+    return out[:top_k]
 
 
 def _file_prefilter(query_vec: list[float], k: int = 10) -> list[str] | None:
@@ -164,4 +198,7 @@ def retrieve(queries: list[str], top_k: int) -> list[RetrievedChunk]:
         key=lambda c: rrf_scores.get(c.id, c.score),
         reverse=True,
     )
-    return reranker.rerank(queries[0], ranked_final[: top_k * 2], top_k)
+    # Rerank a wider slice than needed, then cap docs — the promotion candidates
+    # have to still be in the list when the cap frees a slot.
+    reranked = reranker.rerank(queries[0], ranked_final[: top_k * 3], top_k * 2)
+    return _cap_docs(reranked, top_k, settings.max_doc_chunks)

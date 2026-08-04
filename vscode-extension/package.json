@@ -13,7 +13,9 @@
     "Chat"
   ],
   "main": "./out/extension.js",
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "chatParticipants": [
       {
@@ -30,14 +32,6 @@
           {
             "name": "forge",
             "description": "Forge a paste-ready prompt instead of answering"
-          },
-          {
-            "name": "agent",
-            "description": "Run the agent pipeline (findings, plan, patch)"
-          },
-          {
-            "name": "index",
-            "description": "Index the open workspace folder"
           },
           {
             "name": "history",

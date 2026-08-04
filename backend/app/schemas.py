@@ -44,11 +44,14 @@ class RepoTreeResponse(CamelModel):
 
 class QueryRequest(CamelModel):
     query: str
-    top_k: int = 4
-    use_expansion: bool = True
+    # None = use the configured value. A literal default here shadowed
+    # settings.top_k entirely, so /config advertised one number while every
+    # query used another. Callers can still override per-request.
+    top_k: int | None = None
+    use_expansion: bool | None = None
     model: str | None = None
     session_id: str | None = None
-    mode: str = "answer"  # "answer" | "forge"
+    mode: str = "answer"  # "answer" | "forge" | "auto" (router decides answer vs. forge)
 
 
 class RetrievedChunk(CamelModel):
@@ -76,6 +79,8 @@ class PipelineResult(CamelModel):
     model: str
     latency_ms: int
     cached: bool = False
+    mode: str = "answer"  # resolved concrete mode: "answer" | "forge" (never "auto")
+    turn_id: str | None = None
 
 
 class HistoryItem(CamelModel):
@@ -96,68 +101,10 @@ class FeedbackRequest(CamelModel):
     feedback signal is attributed to individual chunks for per-file re-ranking."""
 
 
-class AgentCard(CamelModel):
-    id: str
-    name: str
-    role: str
-    purpose: str
-    model: str
-    focus: str
-    color: str
-    default_top_k: int = 6
-    use_expansion: bool = True
-
-
-class AgentRunRequest(CamelModel):
-    agent_id: str = "auto"
-    repo_path: str = "."
-    target_path: str
-    user_request: str
-    logs: str = ""
-    attachments: list[str] = []
-    attachment_names: list[str] = []
-    task_type: str | None = None
-    top_k: int = 6
-    use_expansion: bool = False
+class ReviewActionRequest(CamelModel):
+    turn_id: str
+    action: str  # "refine" | "to_answer" | "to_brief"
+    note: str | None = None
     model: str | None = None
 
 
-class CodebaseSummary(CamelModel):
-    root_path: str
-    file_count: int
-    languages: list[str]
-    frameworks: list[str]
-    services: list[str]
-    storage: list[str]
-    signals: list[str]
-    risk_flags: list[str]
-
-
-class AgentFinding(CamelModel):
-    severity: str
-    title: str
-    detail: str
-    files: list[str] = []
-
-
-class AgentLogItem(CamelModel):
-    stage: str
-    message: str
-
-
-class AgentRunResult(CamelModel):
-    agent_id: str
-    agent_name: str
-    model: str
-    target_path: str
-    summary: str
-    architecture: CodebaseSummary
-    relevant_files: list[RetrievedChunk]
-    findings: list[AgentFinding]
-    plan: list[str]
-    prompt: str
-    answer: str
-    patch_diff: str = ""
-    patch_files: list[str] = []
-    logs: list[AgentLogItem]
-    latency_ms: int
