@@ -5,6 +5,7 @@ A full-stack developer tool that answers questions about your codebase using a *
 The core insight: instead of dumping your whole repo into a frontier model's context window (expensive, slow, leaks code), PromptForge retrieves only the top-K relevant chunks, assembles a tight prompt, and generates locally. The headline metric is **tokens saved** vs. a naive whole-repo dump.
 
 ---
+<img width="1536" height="1024" alt="ChatGPT Image Aug 4, 2026, 11_43_56 PM" src="https://github.com/user-attachments/assets/1a5a87d2-2eb9-4eab-a73a-2ce8c0efcba9" />
 
 ## Demo
 
