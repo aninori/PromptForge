@@ -1,9 +1,0 @@
----
-Built PromptForge, a RAG-based AI developer assistant for Coforge's claims-engine codebase, by chunking 1,840 code segments into a Chroma vector store with nomic-embed-text embeddings, layering query optimization and import-graph context expansion, and streaming responses from local Ollama LLMs (Mistral/Qwen) over SSE. Reduced prompt token consumption by ~80% versus naive whole-repo injection — saving 140K+ tokens per query session — enabling developers to get targeted bug fixes, refactor plans, and security audits in under 2 seconds with zero cloud LLM cost.
-
----
-A few notes on what I pulled from:
-- The coforge/claims-engine repo context with 214 files / 1,840 indexed chunks is from your mockData.ts
-- The 140K token savings and ~80% reduction come from the naiveBaseline vs optimized token math in the pipeline
-- Import-graph expansion (chunk neighbors with relevancy penalty) is explicitly implemented in runPipeline
-- The 4 agent types (Debug, Refactor, Docs, Security) + auto-routing and SSE streaming are all in Workbench.tsx + api.ts
