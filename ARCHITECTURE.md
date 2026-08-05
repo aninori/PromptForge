@@ -113,7 +113,7 @@ Classification always uses `small_model` — fast binary decisions that don't ne
   - **Known unfixed:** a query repeating a domain word ("module" ×3) still lets the file named for it (`modules.ts`, 0.945) outrank the component implementing the behaviour. Quotas can't fix this — filtering only reshuffles what already ranked. The real cause is representational: the file prefilter summarises each file by its **first chunk** (imports/boilerplate for a `.tsx`), and code embeds weakly against natural-language questions.
 
 ### Stage 4: Prompt Assembly (`prompt_builder.py`)
-- Builds the final LLM prompt within a **configurable token budget** (default 6000)
+- Builds the final LLM prompt within a **configurable token budget** (`CF_TOKEN_BUDGET`, default 12000)
 - Adds chunks highest-relevancy first, dropping once the budget is exceeded
 - Controls actual token spend — the only real cost optimization step
 - **Anti-fabrication rules.** A confidently wrong brief is worse than no brief: the
@@ -325,13 +325,20 @@ PromptForge/
 | `CF_LARGE_MODEL` | `deepseek-coder-v2:16b` | Large tier — complex queries |
 | `CF_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
 | `CF_GROQ_MODEL` | `qwen/qwen3-32b` | Groq cloud model (when `CF_PROVIDER=groq`) |
-| `CF_TOP_K` | `4` | Default number of chunks to retrieve |
-| `CF_TOKEN_BUDGET` | `6000` | Max tokens for assembled prompt |
+| `CF_NUM_CTX` | `16384` | Context window requested from Ollama. **Must exceed `CF_TOKEN_BUDGET`** with room for the reply — Ollama defaults to 4096 whatever the model supports, so a larger prompt is rejected with a bare `400` ("the prompt is longer than the context length currently available"). Bigger costs RAM and CPU linearly |
+| `CF_TOP_K` | `8` | Chunks retrieved. The real lever on how much code reaches the model — `CF_TOKEN_BUDGET` rarely binds at these sizes |
+| `CF_TOKEN_BUDGET` | `12000` | Max tokens for assembled prompt |
+| `CF_RERANK_WEIGHT` | `0.5` | Cross-encoder's share of the final rank; the rest is vector similarity. `1.0` restores the old override-everything behaviour |
+| `CF_MAX_DOC_CHUNKS` | `2` | Max `.md`/`.txt`/`.rst` chunks per result — a cap, not an exclusion |
 | `CF_USE_EXPANSION` | `true` | Enable multi-query expansion |
 | `CF_CHUNK_SIZE` | `800` | Tokens per chunk during indexing |
 | `CF_CHUNK_OVERLAP` | `120` | Overlap tokens between chunks |
+| `CF_EMBED_CONCURRENCY` | `4` | Simultaneous embed requests during indexing. Ollama serializes work per model, so oversubscribing only deepens its queue until individual requests time out — keep at or below the physical core count |
+| `CF_EMBED_TIMEOUT` | `300` | Per-request embed read timeout (seconds) |
+| `CF_PRICE_PER_MTOK` | `3.00` | USD per million tokens, used for the dashboard's cost estimate |
+| `CF_PRICE_BASIS` | `Claude Sonnet 5 input rates` | Label displayed beside that estimate so the figure stays checkable |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
-| `GROQ_API_KEY` | — | Groq API key (for cloud generation) |
+| `GROQ_API_KEY` | — | Groq API key (for cloud generation). Read from the environment only — never commit a value |
 
 ---
 
@@ -346,6 +353,9 @@ PromptForge/
 | `POST` | `/index` | Index a repo/folder into Chroma (starts the file watcher) |
 | `GET` | `/watcher/status` | Background watcher state (`active`, `path`) |
 | `POST` | `/cache/clear` | Clear the semantic cache |
+| `GET` | `/dashboard` | Self-contained HTML savings dashboard (inline CSS/JS, no CDN); fetches `/savings` same-origin |
+| `GET` | `/savings` | Cumulative turns that never became a Copilot call, by project / day / chat, plus the query-type split and a cost estimate |
+| `POST` | `/savings/reset` | Zero the savings counters |
 | `POST` | `/query` | Full RAG pipeline (blocking) — Query & Forge modes |
 | `POST` | `/query/stream` | Full RAG pipeline (SSE streaming) — Query & Forge modes |
 | `POST` | `/query/review` | Review-gate regeneration (SSE streaming) — refine / to_answer / to_brief, from a stored turn's chunks, never re-retrieves |

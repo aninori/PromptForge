@@ -155,9 +155,13 @@ backend/app/
 ├── generation.py     Blocking + streaming generation (Ollama / Groq)
 ├── cache.py          Semantic cache lookup + save, history listing
 ├── conversation.py   Per-session turn memory (deque, last 5 turns)
-├── agent_runner.py   Role-based agent orchestration (Debug/Refactor/Docs/Security)
-└── agent_registry.py Agent definitions + dynamic agent creation + agents.json persistence
+├── turn_store.py     Per-turn state for the review gate (persisted to .chroma/turns.json)
+├── savings.py        Counts turns that never became a Copilot call
+└── dashboard.py      Self-contained HTML savings dashboard served at /dashboard
 ```
+
+Agent mode was removed: `agent_runner.py` is deleted and `agent_registry.py` now sits
+unimported in `backend/archive/` as reference for possible future per-task templates.
 
 ---
 
@@ -190,9 +194,11 @@ docker compose up
 **Want a faster/smaller model?**
 ```bash
 # In docker-compose.yml, change CF_GEN_MODEL= to one of:
-# mistral:7b         (~4 GB, fast)
-# qwen2.5-coder:7b   (~4 GB, good at code)
+# qwen2.5-coder:7b       (~4 GB, good at code, much faster on CPU)
 # deepseek-coder-v2:16b  (~9 GB, best quality, default)
+#
+# On a CPU-only host the generation model dominates latency: a 16B model can
+# take minutes per answer where a 7B takes well under one.
 ```
 
 ---
@@ -239,10 +245,20 @@ curl -X POST http://localhost:8000/index \
 |---|---|---|
 | `CF_PROVIDER` | `ollama` | `ollama` or `groq` |
 | `CF_GEN_MODEL` | `deepseek-coder-v2:16b` | Generation model |
+| `CF_SMALL_MODEL` | `llama3.2:3b` | Complexity + request-type classifiers, query optimization |
+| `CF_GUARD_MODEL` | `qwen2.5-coder:7b` | Intent guard only — bigger on purpose; a wrong call here refuses a real question |
+| `CF_LARGE_MODEL` | `deepseek-coder-v2:16b` | Complex queries |
 | `CF_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
-| `CF_TOP_K` | `4` | Chunks per query |
-| `CF_TOKEN_BUDGET` | `6000` | Max prompt tokens |
+| `CF_NUM_CTX` | `16384` | Context window requested from Ollama. **Must exceed `CF_TOKEN_BUDGET`** — Ollama defaults to 4096 regardless of model, which rejects larger prompts with a bare 400 |
+| `CF_EMBED_CONCURRENCY` | `4` | Simultaneous embed requests. Ollama serializes per model, so oversubscribing just deepens its queue until requests time out — keep at or below physical core count |
+| `CF_EMBED_TIMEOUT` | `300` | Per-request embed timeout (seconds) |
+| `CF_TOP_K` | `8` | Chunks per query — the real lever on how much code reaches the model |
+| `CF_TOKEN_BUDGET` | `12000` | Max prompt tokens |
+| `CF_RERANK_WEIGHT` | `0.5` | How much the cross-encoder overrides vector similarity (1.0 = full override) |
+| `CF_MAX_DOC_CHUNKS` | `2` | Max `.md`/`.txt` chunks in a result — stops docs crowding out code |
 | `CF_USE_EXPANSION` | `true` | Multi-query expansion |
+| `CF_PRICE_PER_MTOK` | `3.00` | Rate for the dashboard's cost estimate (USD per million tokens) |
+| `CF_PRICE_BASIS` | `Claude Sonnet 5 input rates` | Label shown beside that estimate |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama base URL |
 | `CF_CHROMA_DIR` | `./.chroma` | Vector store path |
 | `GROQ_API_KEY` | — | Required if `CF_PROVIDER=groq` |
